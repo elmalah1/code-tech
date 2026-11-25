@@ -44165,21 +44165,79 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = POSApp(root)
 
-    # أسود مراقبة التجمّد: لو توقفت الواجهة > 10 ثوان، يُكتَب السطر عالق بالضبط في freeze_log.txt بجانب الـ exe
+    # صندوق أسود مراقبة التجمّد:
+    #  1) freeze_log.txt بجوار الـ exe: يُسجّل أثر الخيوط تلقائياً إذا توقفت الواجهة > 10 ثوانٍ.
+    #  2) مراقب خلفي: إذا توقفت الواجهة > 12 ثانية يُظهر نافذة رسالة (Win32 تعمل حتى لو Tk متوقف)
+    #     تعرض اسم الدالة والسطر العالق فوراً، مع تسجيله في الملف أيضاً.
     try:
-        import faulthandler, sys
+        import faulthandler, sys, tempfile
         _log_path = os.path.join(
             os.path.dirname(sys.executable if getattr(sys, "frozen", False) else __file__),
             "freeze_log.txt")
         _fh = open(_log_path, "a", buffering=1)
         faulthandler.enable(file=_fh)
 
+        def _log_freeze(text):
+            try:
+                _fh.write("\n==== %s ====\n%s\n" % (
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text))
+            except Exception:
+                pass
+
+        _alive = {"t": time.time(), "started": False}
+
         def _heartbeat():
+            _alive["t"] = time.time()
+            _alive["started"] = True
             faulthandler.cancel_dump_traceback_later()
             faulthandler.dump_traceback_later(10, file=_fh)
             root.after(1000, _heartbeat)
 
-        _heartbeat()
+        def _watchdog():
+            fired = False
+            while True:
+                time.sleep(3)
+                try:
+                    if not _alive.get("started"):
+                        continue
+                    lag = time.time() - _alive["t"]
+                except Exception:
+                    lag = 0
+                if lag > 12:
+                    if fired:
+                        continue
+                    fired = True
+                    snap_path = os.path.join(tempfile.gettempdir(), "freeze_snap.txt")
+                    body = (f"توقفت واجهة البرنامج عن الاستجابة لأكثر من {int(lag)} ثانية.\n"
+                            "السطر العالق موضّح بعد سطر File في القائمة التالية (أول قائمة = الخيط الرئيسي):\n")
+                    try:
+                        with open(snap_path, "w", encoding="utf-8") as f2:
+                            faulthandler.dump_traceback(file=f2)
+                        with open(snap_path, encoding="utf-8", errors="ignore") as f2:
+                            stack = f2.read()
+                        body += stack[-5000:]
+                        _log_freeze(f"[مشاهَد] تأخر الخيط الرئيسي {int(lag)} ثانية\n{stack[-5000:]}")
+                    except Exception as e:
+                        body += f"\nتعذّر التقاط أثر الخيوط: {e}"
+                        _log_freeze(f"[مشاهَد] تأخر الخيط الرئيسي {int(lag)} ثانية (تعذّر الأثر: {e})")
+                    try:
+                        import ctypes
+                        ctypes.windll.user32.MessageBoxW(
+                            0, body[:6000],
+                            "تقرير تجميد تلقائي — اقرأ أول File ثم أرسله للمبرمج", 0x10)
+                    except Exception:
+                        pass
+                else:
+                    fired = False
+
+        def _start_watchdog():
+            try:
+                threading.Thread(target=_watchdog, daemon=True).start()
+            except Exception:
+                pass
+
+        root.after(100, _start_watchdog)
+        root.after(1000, _heartbeat)
     except Exception:
         pass
 
