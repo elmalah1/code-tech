@@ -7525,9 +7525,10 @@ class DeliveryMixin:
     def _dlv_susp_code_sql():
         return "CONCAT(IF(o.order_type='delivery','DLV-','TKW-'), o.id)"
 
-    def _dlv_fetch_orders(self):
+    def _dlv_fetch_orders(self, q=None):
+        _q = q if q is not None else self._dlv_q
         code = self._dlv_susp_code_sql()
-        rows = self._dlv_q(
+        rows = _q(
             "SELECT o.id, o.order_type, o.status, o.customer_name, o.phone, o.address, o.zone_name, "
             "o.delivery_fee, o.created_at, o.promised_at, o.ready_at, o.dispatched_at, o.delivered_at, "
             "o.driver_id, o.driver_name, o.invoice_id, o.payment_mode, o.notes, i.total_amount, "
@@ -7541,6 +7542,7 @@ class DeliveryMixin:
             "WHERE o.status IN ('preparing','ready','out') "
             "OR (o.status='done' AND o.delivered_at >= CURDATE()) "
             "ORDER BY o.created_at", fresh=True)
+
         out = []
         for r in rows:
             o = dict(zip(self._DLV_FIELDS, r))
@@ -7562,7 +7564,29 @@ class DeliveryMixin:
         except Exception:
             return 0.0
 
+
+    def _dlv_fetch_orders_threaded(self):
+        """جلب الطلبات في خيط خلفي بربط مستقل — لا يمسّ اتصال الواجهة المشترك."""
+        conn = pymysql.connect(**self.db_config)
+        try:
+            cur = conn.cursor()
+
+            def _iso_q(sql, params=(), one=False, fresh=False):
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                if one:
+                    return rows[0] if rows else None
+                return rows
+
+            return self._dlv_fetch_orders(q=_iso_q)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def _dlv_poll(self, force=False):
+        """حلقة التحديث الدورية: الاستعلام في خيط خلفي، والرسم في خيط الواجهة فقط."""
         win = getattr(self, '_dlv_win', None)
         if win is None:
             return
@@ -7573,17 +7597,26 @@ class DeliveryMixin:
         except Exception:
             self._dlv_win = None
             return
+        if not getattr(self, '_dlv_fetch_inflight', False):
+            self._dlv_fetch_inflight = True
+
+            def _worker():
+                orders, err = [], None
+                try:
+                    orders = self._dlv_fetch_orders_threaded()
+                except Exception as _fe:
+                    err = _fe
+                self._dlv_fetch_inflight = False
+                try:
+                    self.root.after(0, lambda: self._dlv_apply_orders(orders, err, force))
+                except Exception:
+                    pass
+
+            threading.Thread(target=_worker, daemon=True).start()
         try:
             self._dlv_sync_clock()
-            orders = self._dlv_fetch_orders()
-            self._dlv_last_orders = orders
-            sig = tuple((o['id'], o['status'], o['driver_id'], o['invoice_id'], o['has_susp'], o['due'])
-                        for o in orders)
-            if force or sig != getattr(self, '_dlv_sig', None):
-                self._dlv_sig = sig
-                self._dlv_render(orders)
-        except Exception as e:
-            print(f"تعذر تحديث شاشة الدليفري: {e}")
+        except Exception:
+            pass
         if getattr(self, '_dlv_poll_job', None):
             try:
                 self.root.after_cancel(self._dlv_poll_job)
@@ -7591,6 +7624,30 @@ class DeliveryMixin:
                 pass
         self._dlv_poll_job = self.root.after(4000, self._dlv_poll)
 
+    def _dlv_apply_orders(self, orders, err, force):
+        """(خيط الواجهة) تطبيق نتيجة الجلب التي أنجزها الخيط الخلفي."""
+        win = getattr(self, '_dlv_win', None)
+        if win is None:
+            return
+        try:
+            if not win.winfo_exists():
+                self._dlv_win = None
+                return
+        except Exception:
+            self._dlv_win = None
+            return
+        if err is not None:
+            print(f"تعذّر تحديث شاشة الدليفري: {err}")
+            return
+        try:
+            self._dlv_last_orders = orders
+            sig = tuple((o['id'], o['status'], o['driver_id'], o['invoice_id'], o['has_susp'], o['due'])
+                        for o in orders)
+            if force or sig != getattr(self, '_dlv_sig', None):
+                self._dlv_sig = sig
+                self._dlv_render(orders)
+        except Exception as e:
+            print(f"تعذّر تحديث شاشة الدليفري: {e}")
     def _dlv_on_search(self):
         orders = getattr(self, '_dlv_last_orders', None)
         if orders is not None and getattr(self, '_dlv_win', None) is not None:
@@ -14314,25 +14371,51 @@ class POSApp(DeliveryMixin, PackagesMixin):
 
         approve_btn.config(command=approve_reward)
         reject_btn.config(command=reject_reward)
+
     def _watch_rating_popup(self, popup):
-        """مراقبة current_rater_id - إذا أصبح NULL أغلق النافذة تلقائياً"""
+        """مراقبة current_rater_id في خيط خلفي - إذا أصبح NULL أُغلقت النافذة تلقائياً
+        (الاتصال بقاعدة البيانات لم يعد يحدث في خيط الواجهة حتى لا تتجمّد النافذة)."""
         if not popup.winfo_exists():
             return
-        try:
-            import pymysql
-            conn = pymysql.connect(**self.db_config)
-            cursor = conn.cursor()
-            cursor.execute("SELECT current_rater_id FROM app_state WHERE id = 1")
-            row = cursor.fetchone()
-            conn.close()
+        if getattr(self, "_rating_watch_running", False):
+            return
+        self._rating_watch_running = True
 
-            if row and row[0] is None:
-                popup.destroy()
-                return
-        except:
-            pass
+        def _check():
+            rater_is_none = False
+            try:
+                conn = pymysql.connect(**self.db_config)
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT current_rater_id FROM app_state WHERE id = 1")
+                    row = cur.fetchone()
+                    rater_is_none = bool(row and row[0] is None)
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self._rating_watch_running = False
 
-        popup.after(1000, lambda: self._watch_rating_popup(popup))
+            def _apply():
+                try:
+                    if not popup.winfo_exists():
+                        return
+                    if rater_is_none:
+                        popup.destroy()
+                    else:
+                        popup.after(1000, lambda: self._watch_rating_popup(popup))
+                except Exception:
+                    pass
+
+            try:
+                self.root.after(0, _apply)
+            except Exception:
+                self._rating_watch_running = False
+
+        threading.Thread(target=_check, daemon=True).start()
 
     # --- إضافة دالة جديدة لتحديث الإجماليات مع الخصم ---
 
@@ -24040,7 +24123,19 @@ class POSApp(DeliveryMixin, PackagesMixin):
             return False
         return True
 
+
     def open_cash_drawer(self, printer_name=None):
+        """يفتح درج النقود في خيط خلفي — لو تعطّل السبولر تبقى الواجهة مستجيبة."""
+        def _worker():
+            try:
+                self._open_cash_drawer_blocking(printer_name)
+            except Exception as _e:
+                print(f"خطأ في فتح درج الكاشير: {_e}")
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+
+    def _open_cash_drawer_blocking(self, printer_name=None):
+
         """يفتح درج النقود عبر الطابعة بإرسال أمر ESC/POS"""
         try:
             if printer_name is None:
