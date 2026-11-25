@@ -16445,7 +16445,8 @@ class POSApp(DeliveryMixin, PackagesMixin):
         self._poll_suspended_invoices()
 
     def _poll_suspended_invoices(self):
-        """يفحص دورياً الفواتير المعلقة في قاعدة البيانات ويزامن قائمة الأزرار معها"""
+        """يفحص دورياً الفواتير المعلقة في قاعدة البيانات ويزامن قائمة الأزرار معها.
+        الاستعلام يعمل في خيط خلفي حتى لا تتجمد الواجهة عند بطء أو انقطاع الشبكة."""
         if getattr(self, '_switching_invoice', False):
             self.root.after(500, self._poll_suspended_invoices)
             return
@@ -16454,89 +16455,151 @@ class POSApp(DeliveryMixin, PackagesMixin):
             self.root.after(2000, self._poll_suspended_invoices)
             return
 
-        try:
-            conn = pymysql.connect(**self.db_config)
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT id, invoice_number, customer_name, customer_id, "
-                "       products, created_at, queue_ticket_id, label "
-                "FROM suspended_invoices ORDER BY created_at"
-            )
-            db_rows = cursor.fetchall()
-            conn.close()
+        if getattr(self, '_poll_suspended_running', False):
+            self.root.after(2000, self._poll_suspended_invoices)
+            return
+        self._poll_suspended_running = True
 
-            db_invoices = []
-            for idx, row in enumerate(db_rows):
-                try:
-                    products = json.loads(row[4])
+        def _worker():
+            res = {'ok': False, 'db_invoices': [], 'fingerprint': None, 'err': None}
+            conn = None
+            try:
+                conn = pymysql.connect(**self.db_config)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id, invoice_number, customer_name, customer_id, "
+                    "       products, created_at, queue_ticket_id, label "
+                    "FROM suspended_invoices ORDER BY created_at"
+                )
+                db_rows = cursor.fetchall()
+                db_invoices = []
+                for idx, row in enumerate(db_rows):
+                    try:
+                        products = json.loads(row[4])
+                        customer_id_raw = row[3]
+                        customer_id = int(customer_id_raw) if customer_id_raw is not None else None
+                        db_invoices.append({
+                            'db_id': row[0],
+                            'number': idx + 1,
+                            'invoice_number': row[1],
+                            'customer_name': row[2] or 'عميل غير محدد',
+                            'customer_id': customer_id,
+                            'products': products,
+                            'timestamp': row[5].strftime("%Y-%m-%d %H:%M:%S")
+                            if row[5] else "",
+                            'queue_ticket_id': row[6],
+                            'label': row[7]
+                        })
+                    except Exception:
+                        continue
+                fingerprint = json.dumps([
+                    {
+                        'db_id': inv['db_id'],
+                        'customer_name': inv['customer_name'],
+                        'customer_id': inv['customer_id'],
+                        'label': inv.get('label'),
+                        'products': inv['products']
+                    }
+                    for inv in db_invoices
+                ], ensure_ascii=False, sort_keys=True)
+                res.update(ok=True, db_invoices=db_invoices, fingerprint=fingerprint)
+            except Exception as e:
+                res['err'] = str(e)
+                print(f"poll error: {e}")
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                self._poll_suspended_running = False
+            try:
+                self.root.after(0, lambda: self._apply_suspended_poll(res))
+            except Exception:
+                pass
 
-                    # ✅ تحويل customer_id بشكل آمن
-                    customer_id_raw = row[3]
-                    customer_id = int(customer_id_raw) if customer_id_raw is not None else None
-
-                    db_invoices.append({
-                        'db_id': row[0],
-                        'number': idx + 1,
-                        'invoice_number': row[1],
-                        'customer_name': row[2] or 'عميل غير محدد',
-                        'customer_id': customer_id,
-                        'products': products,
-                        'timestamp': row[5].strftime("%Y-%m-%d %H:%M:%S")
-                        if row[5] else "",
-                        'queue_ticket_id': row[6],
-                        'label': row[7]
-                    })
-                except Exception:
-                    continue
-
-            new_fingerprint = json.dumps([
-                {
-                    'db_id': inv['db_id'],
-                    'customer_name': inv['customer_name'],
-                    'customer_id': inv['customer_id'],
-                    'label': inv.get('label'),
-                    'products': inv['products']
-                }
-                for inv in db_invoices
-            ], ensure_ascii=False, sort_keys=True)
-
-            if new_fingerprint != getattr(self, '_last_suspended_fingerprint', None):
-                self._last_suspended_fingerprint = new_fingerprint
-                self._sync_suspended_from_db(db_invoices)
-
-        except Exception as e:
-            print(f"poll error: {e}")
-
+        threading.Thread(target=_worker, daemon=True).start()
         self.root.after(2000, self._poll_suspended_invoices)
 
+    def _apply_suspended_poll(self, res):
+        """(الخيط الرئيسي) يطبّق نتيجة استقصاء الفواتير المعلقة على الواجهة"""
+        try:
+            if getattr(self, '_switching_invoice', False) or getattr(self, '_saving_suspended', False):
+                return
+            if not res or not res.get('ok'):
+                return
+            if res['fingerprint'] != getattr(self, '_last_suspended_fingerprint', None):
+                self._last_suspended_fingerprint = res['fingerprint']
+                self._sync_suspended_from_db(res['db_invoices'])
+        except Exception as e:
+            print(f"suspended poll apply error: {e}")
+
     def _poll_active_invoice_updates(self):
-        """يفحص دورياً تحديثات الفاتورة المعلقة المفتوحة حالياً من أجهزة أخرى ويحدّثها"""
+        """يفحص دورياً تحديثات الفاتورة المعلقة المفتوحة حالياً من أجهزة أخرى ويحدّثها.
+        الاستعلام يعمل في خيط خلفي حتى لا تتجمد الواجهة عند بطء أو انقطاع الشبكة."""
+        if getattr(self, '_switching_invoice', False):
+            self.root.after(500, self._poll_active_invoice_updates)
+            return
+
+        if not hasattr(self, 'current_suspended_index') \
+                or self.current_suspended_index is None \
+                or self.current_suspended_index >= len(self.suspended_invoices):
+            self.root.after(2000, self._poll_active_invoice_updates)
+            return
+
+        if getattr(self, '_poll_active_running', False):
+            self.root.after(2000, self._poll_active_invoice_updates)
+            return
+        self._poll_active_running = True
+
+        idx = self.current_suspended_index
+        db_id = self.suspended_invoices[idx].get('db_id')
+
+        def _worker():
+            res = {'ok': False, 'row': None, 'err': None, 'idx': idx, 'db_id': db_id}
+            conn = None
+            try:
+                conn = pymysql.connect(**self.db_config)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT products, customer_name, customer_id FROM suspended_invoices WHERE id = %s",
+                    (db_id,)
+                )
+                res['row'] = cursor.fetchone()
+                res['ok'] = True
+            except Exception as e:
+                res['err'] = str(e)
+                print(f"active invoice poll error: {e}")
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                self._poll_active_running = False
+            try:
+                self.root.after(0, lambda: self._apply_active_invoice_poll(res))
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self.root.after(2000, self._poll_active_invoice_updates)
+
+    def _apply_active_invoice_poll(self, res):
+        """(الخيط الرئيسي) يطبّق نتيجة استقصاء الفاتورة المفتوحة على الواجهة"""
         try:
             if getattr(self, '_switching_invoice', False):
-                self.root.after(500, self._poll_active_invoice_updates)
                 return
-
-            if not hasattr(self, 'current_suspended_index') \
-                    or self.current_suspended_index is None \
-                    or self.current_suspended_index >= len(self.suspended_invoices):
-                self.root.after(2000, self._poll_active_invoice_updates)
+            idx = res.get('idx')
+            db_id = res.get('db_id')
+            if idx is None or self.current_suspended_index != idx:
+                return                      # تغيّرت الفاتورة الحالية أثناء الاستعلام — النتيجة قديمة
+            if not res.get('ok'):
                 return
-
-            current = self.suspended_invoices[self.current_suspended_index]
-
-            db_id = current.get('db_id')
-            if not db_id:
-                self.root.after(2000, self._poll_active_invoice_updates)
+            current = self.suspended_invoices[idx]
+            if current.get('db_id') != db_id:
                 return
-
-            conn = pymysql.connect(**self.db_config)
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT products, customer_name, customer_id FROM suspended_invoices WHERE id = %s",
-                (db_id,)
-            )
-            row = cursor.fetchone()
-            conn.close()
+            row = res.get('row')
 
             if not row:
                 for item in self.product_list.get_children():
@@ -16547,13 +16610,11 @@ class POSApp(DeliveryMixin, PackagesMixin):
                 self.current_suspended_index = None
                 self.current_suspended_db_id = None
                 self.update_totals()
-                self.root.after(2000, self._poll_active_invoice_updates)
                 return
 
             db_products = json.loads(row[0])
             db_customer_name = row[1]
 
-            # ✅ تحويل customer_id بشكل آمن
             db_customer_id_raw = row[2]
             db_customer_id = int(db_customer_id_raw) if db_customer_id_raw is not None else None
 
@@ -16576,7 +16637,6 @@ class POSApp(DeliveryMixin, PackagesMixin):
                     self.customer_label.config(text=display_name)
                     current['customer_name'] = db_customer_name
 
-                # ✅ تحديث customer_id دائماً عند تغيير المحتوى
                 if db_customer_id != self.selected_customer_id:
                     self.selected_customer_id = db_customer_id
                     current['customer_id'] = db_customer_id
@@ -16586,7 +16646,6 @@ class POSApp(DeliveryMixin, PackagesMixin):
                 self.update_totals()
 
             else:
-                # ✅ حتى لو المنتجات لم تتغير، تحقق من customer_id
                 if db_customer_id is not None and db_customer_id != self.selected_customer_id:
                     self.selected_customer_id = db_customer_id
                     current['customer_id'] = db_customer_id
@@ -16599,8 +16658,6 @@ class POSApp(DeliveryMixin, PackagesMixin):
 
         except Exception as e:
             print(f"active invoice poll error: {e}")
-
-        self.root.after(2000, self._poll_active_invoice_updates)
 
     def _sync_suspended_from_db(self, db_invoices):
         """تحديث الأزرار والقائمة عند اكتشاف تغيير"""
